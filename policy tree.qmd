@@ -1,0 +1,262 @@
+---
+title: "Policy Tree"
+date: today
+author: "R26144097李祐君"
+format: pdf
+editor: visual
+toc: true
+---
+
+```{r,warning=FALSE,message=FALSE}
+# Load data
+setwd("C:/Users/user/Desktop")
+data <- read.csv('bank-direct-marketing-campaigns.csv')
+
+# Load package
+library(grf)
+library(policytree)
+library(ggplot2)
+library(DiagrammeR)
+
+# Observe data
+head(data)
+str(data)
+library(DataExplorer)
+plot_missing(data)
+library(Hmisc)
+describe(data)
+barplot(table(data$y),col='lightblue',main='variable y barplot',
+        ylab='count',xlab='y')
+```
+
+# STEP 1: Data Preprocessing 
+```{r,warning=FALSE,message=FALSE}
+library(dplyr)
+library(tidyr)
+
+cols_to_check <- c("job","marital", "education","default", "housing", "loan")
+data <- data %>%
+  filter(
+    if_all(all_of(cols_to_check), ~ . != "unknown")
+  )
+print(paste("Remaining rows:", nrow(data)))
+
+# 1.2 Define Outcome (Y)
+data$y <- ifelse(data$y == 'yes', 1, 0)
+Y <- data$y
+
+# 1.3 Clean data to keep only X variables
+# 這裡我們從已經刪除 unknown 的 'data' 建立 data_cleaned
+data_cleaned <- subset(data, select = -c(
+  default,
+  campaign, pdays, previous, poutcome, # Post-treatment / unwanted variables
+  y,                                   # Remove Outcome from X
+  contact, month, day_of_week          # Remove Treatment from X
+))
+
+# 1.4 Create Feature Matrix (X)
+X <- model.matrix(~ ., data = data_cleaned)[, -1] #刪除截距
+
+print(paste("Dimensions of X:", paste(dim(X), collapse = " x ")))
+```
+
+# Model 1 - contact method
+## STEP 2: Doubly Robust Scoring (GRF)
+```{r}
+#  Define Treatment (W)
+W <- as.factor(data$contact)
+barplot(table(W),col='lightblue',main='contact method barplot',
+        ylab='count',xlab='contact method')
+#set.seed(2025)
+multi.forest <- grf::multi_arm_causal_forest(X, Y, W)
+DR.scores <- double_robust_scores(multi.forest)
+head(DR.scores)
+```
+
+## STEP 3: Policy Optimization (Policytree)
+```{r}
+action_names <- levels(W)
+tr <- policy_tree(X, DR.scores, depth = 1) 
+plot(tr, leaf.labels = action_names)
+```
+
+## STEP 4: 評估模型好壞 (Evaluation)
+```{r}
+# 1. 計算基準線 (Baselines)
+# (A) 隨機分派 (Random Allocation) 的期望值
+value_random <- mean(DR.scores)
+
+# (B) 最佳固定策略 (Best Fixed Treatment)
+# 意思是：如果我們不管特徵，對「所有人」都用 Action 1，或對「所有人」都用 Action 2
+# 看哪一個平均分數最高，就當作我們的競爭對手
+fixed_means <- colMeans(DR.scores)
+best_fixed_action <- names(which.max(fixed_means))
+value_best_fixed <- max(fixed_means)
+
+print(paste("隨機分派的價值:", round(value_random, 4)))
+print(paste("最佳固定策略 (對所有人用", best_fixed_action, ") 的價值:", round(value_best_fixed, 4)))
+
+
+# 2. 計算 Policy Tree 的價值
+# (A) 讓樹預測每個人該用哪個 Action (回傳的是 1, 2... 的索引)
+preds_idx <- predict(tr, X)
+
+# (B) 抓出每個人「被分派到的那個 Action」的 DR Score
+n <- nrow(DR.scores)
+rewards_picked <- DR.scores[cbind(1:n, preds_idx)]
+
+# (C) 算出平均 (這就是您的模型分數)
+value_tree <- mean(rewards_picked)
+
+print(paste("Policy Tree 的價值:", round(value_tree, 4)))
+
+
+# 3. 比較與結論
+uplift_vs_random <- value_tree - value_random
+uplift_vs_best   <- value_tree - value_best_fixed
+
+print("【最終評估報告】")
+if (uplift_vs_best > 0) {
+  print(paste("成功！您的模型比「最佳固定策略」提升了:", round(uplift_vs_best, 5)))
+  print(paste(" (相當於提升了", round((uplift_vs_best/value_best_fixed)*100, 2), "%)"))
+} 
+```
+
+# Model 2 - month
+```{r}
+# observe features-month 
+ggplot(data, aes(x = month, fill = month)) +
+  geom_bar() +
+  labs(title = "Count of Month", x = "month", y = "Count") +
+  theme_minimal()
+
+# reDefine Treatment (W) - Use 'month' for multi-treatment
+data$month <- ifelse(data$month=='mar'|data$month=='apr'|data$month=='may','spring'
+                     ,ifelse(data$month=='jun'|data$month=='jul'|data$month=='aug'
+                             ,'summer','winter'))
+ggplot(data, aes(x = month, fill = month)) +
+  geom_bar() +
+  labs(title = "Count of season", x = "season", y = "Count") +
+  theme_minimal()
+W <- as.factor(data$month)
+```
+
+## STEP 2: Doubly Robust Scoring (GRF)
+```{r}
+set.seed(2025)
+multi.forest <- grf::multi_arm_causal_forest(X, Y, W)
+DR.scores <- double_robust_scores(multi.forest)
+head(DR.scores)
+```
+
+## STEP 3: Policy Optimization (Policytree)
+```{r}
+action_names <- levels(W)
+tr <- policy_tree(X, DR.scores, depth = 2)
+plot(tr, leaf.labels = action_names)
+```
+
+## STEP 4: 評估模型好壞 (Evaluation)
+```{r}
+# 1. 計算基準線 (Baselines)
+# (A) 隨機分派 (Random Allocation) 的期望值
+value_random <- mean(DR.scores)
+
+# (B) 最佳固定策略 (Best Fixed Treatment)
+# 意思是：如果我們不管特徵，對「所有人」都用 Action 1，或對「所有人」都用 Action 2
+# 看哪一個平均分數最高，就當作我們的競爭對手
+fixed_means <- colMeans(DR.scores)
+best_fixed_action <- names(which.max(fixed_means))
+value_best_fixed <- max(fixed_means)
+
+print(paste("隨機分派的價值:", round(value_random, 4)))
+print(paste("最佳固定策略 (對所有人用", best_fixed_action, ") 的價值:", round(value_best_fixed, 4)))
+
+
+# 2. 計算 Policy Tree 的價值
+# (A) 讓樹預測每個人該用哪個 Action (回傳的是 1, 2... 的索引)
+preds_idx <- predict(tr, X)
+
+# (B) 抓出每個人「被分派到的那個 Action」的 DR Score
+n <- nrow(DR.scores)
+rewards_picked <- DR.scores[cbind(1:n, preds_idx)]
+
+# (C) 算出平均 (這就是您的模型分數)
+value_tree <- mean(rewards_picked)
+
+print(paste("Policy Tree 的價值:", round(value_tree, 4)))
+
+
+# 3. 比較與結論
+uplift_vs_random <- value_tree - value_random
+uplift_vs_best   <- value_tree - value_best_fixed
+
+if (uplift_vs_best > 0) {
+  print(paste("成功！您的模型比「最佳固定策略」提升了:", round(uplift_vs_best, 5)))
+  print(paste(" (相當於提升了", round((uplift_vs_best/value_best_fixed)*100, 2), "%)"))
+} 
+```
+
+# Model 3 - day of week
+```{r}
+ggplot(data, aes(x = day_of_week, fill = day_of_week)) +
+  geom_bar() +
+  labs(title = "Count", x = "day_of_week", y = "Count") +
+  theme_minimal()
+W <- as.factor(data$day_of_week)
+```
+
+## STEP 2: Doubly Robust Scoring (GRF)
+```{r}
+set.seed(2025)
+multi.forest <- grf::multi_arm_causal_forest(X, Y, W)
+DR.scores <- double_robust_scores(multi.forest)
+head(DR.scores)
+```
+
+## STEP 3: Policy Optimization (Policytree)
+```{r}
+action_names <- levels(W)
+tr <- policy_tree(X, DR.scores, depth = 1)
+plot(tr, leaf.labels = action_names)
+```
+
+## STEP 4: 評估模型好壞 (Evaluation)
+```{r}
+# 1. 計算基準線 (Baselines)
+# (A) 隨機分派 (Random Allocation) 的期望值
+value_random <- mean(DR.scores)
+
+# (B) 最佳固定策略 (Best Fixed Treatment)
+# 意思是：如果我們不管特徵，對「所有人」都用 Action 1，或對「所有人」都用 Action 2
+# 看哪一個平均分數最高，就當作我們的競爭對手
+fixed_means <- colMeans(DR.scores)
+best_fixed_action <- names(which.max(fixed_means))
+value_best_fixed <- max(fixed_means)
+
+print(paste("隨機分派的價值:", round(value_random, 4)))
+print(paste("最佳固定策略 (對所有人用", best_fixed_action, ") 的價值:", round(value_best_fixed, 4)))
+
+
+# 2. 計算 Policy Tree 的價值
+# (A) 讓樹預測每個人該用哪個 Action (回傳的是 1, 2... 的索引)
+preds_idx <- predict(tr, X)
+
+# (B) 抓出每個人「被分派到的那個 Action」的 DR Score
+n <- nrow(DR.scores)
+rewards_picked <- DR.scores[cbind(1:n, preds_idx)]
+
+# (C) 算出平均 (這就是您的模型分數)
+value_tree <- mean(rewards_picked)
+
+print(paste("Policy Tree 的價值:", round(value_tree, 4)))
+
+# 3. 比較與結論
+uplift_vs_random <- value_tree - value_random
+uplift_vs_best   <- value_tree - value_best_fixed
+
+if (uplift_vs_best > 0) {
+  print(paste("成功！您的模型比「最佳固定策略」提升了:", round(uplift_vs_best, 5)))
+  print(paste("   (相當於提升了", round((uplift_vs_best/value_best_fixed)*100, 2), "%)"))
+} 
+```
